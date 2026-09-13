@@ -334,13 +334,36 @@ Future<void> downloadChapter(
               }
               videoHeader.addAll(videosUrls.first.headers ?? {});
               isOk = true;
+            } else if (value.$1.isNotEmpty) {
+              // Got a video list, but nothing matched .m3u8/.m3u or a known
+              // video extension. Some sources hand back signed URLs that merely
+              // *redirect* to the media file — e.g. anime3rb's vid3rb links end
+              // in neither .m3u8 nor a file extension, but 302 to a real .mp4
+              // (question marks / tokens keep the path extensionless). Best
+              // effort: download the first URL directly; the downloader follows
+              // the redirect, and if it is not actually media the attempt fails
+              // visibly instead of stalling or erroring out up front.
+              final fallback = value.$1.first;
+              final fallbackLower = fallback.url.toLowerCase();
+              if (fallbackLower.contains('.m3u') ||
+                  fallbackLower.contains('.m3u8')) {
+                m3u8Downloader = M3u8Downloader(
+                  m3u8Url: fallback.url,
+                  downloadDir: chapterDirectory.path,
+                  headers: fallback.headers ?? {},
+                  subtitles: fallback.subtitles,
+                  subDownloadDir: subtitleDirectoryBase,
+                  fileName: p.join(mangaMainDirectory.path, "$chapterName.mp4"),
+                  chapter: chapter,
+                );
+                hasM3U8File = true;
+              } else {
+                pageUrls = [PageUrl(fallback.url)];
+              }
+              videoHeader.addAll(fallback.headers ?? {});
+              isOk = true;
             } else {
-              // Got a video list but nothing matched .m3u8/.m3u or a known video
-              // extension — record why instead of spinning forever below.
-              startFailure = value.$1.isEmpty
-                  ? "No videos returned by the source"
-                  : "No downloadable URL among ${value.$1.length} video(s) "
-                        "(none matched .m3u8/.m3u or a known extension)";
+              startFailure = "No videos returned by the source";
             }
           })
           .catchError((Object e) {

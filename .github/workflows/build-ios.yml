@@ -1,0 +1,33 @@
+name: Build iOS IPA
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-ios:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          architecture: x64
+      - name: setup rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,x86_64-apple-ios
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          cache-on-failure: true
+      - name: flutter pub get
+        run: flutter pub get
+      - name: build unsigned ipa
+        run: flutter build ipa --release --no-codesign
+      - name: upload ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: mangayomi-ios-unsigned
+          path: build/ios/ipa/*.ipa
