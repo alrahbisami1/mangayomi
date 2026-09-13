@@ -24,10 +24,16 @@ jobs:
           cache-on-failure: true
       - name: flutter pub get
         run: flutter pub get
-      - name: build unsigned ipa
-        run: flutter build ipa --release --no-codesign
+      - name: build unsigned app
+        run: flutter build ios --release --no-codesign
+      - name: package ipa from Runner.app
+        run: |
+          mkdir -p build/ios/ipa/Payload
+          cp -R build/ios/iphoneos/Runner.app build/ios/ipa/Payload/
+          cd build/ios/ipa
+          zip -qr ../mangayomi-unsigned.ipa Payload
       - name: upload ipa
         uses: actions/upload-artifact@v4
         with:
           name: mangayomi-ios-unsigned
-          path: build/ios/ipa/*.ipa
+          path: build/ios/mangayomi-unsigned.ipa
