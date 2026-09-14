@@ -2,6 +2,7 @@ import 'dart:collection';
 import 'dart:isolate';
 import 'dart:async';
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart';
@@ -18,6 +19,18 @@ import 'package:path/path.dart' as path;
 import 'package:encrypt/encrypt.dart' as encrypt;
 
 final downloadTaskCancellation = <String, bool>{};
+
+/// Segmented (range-parallel) video download constants.
+///
+/// vid3rb-type CDNs rate-limit a single connection to a few hundred KB/s but
+/// answer 206 Partial Content, so splitting a file into byte ranges and
+/// pulling a couple in parallel recovers multi-connection throughput. More
+/// concurrent starts trigger nginx 503s, so concurrency stays deliberately low
+/// and every stalled slice is retried with resume instead of being restarted.
+const _maxSegments = 4;
+const _minSegmentBytes = 6 * 1024 * 1024;
+const _segmentConcurrency = 2;
+const _segmentMaxAttempts = 6;
 
 /// Shared Isolate pool to optimize performance
 /// Instead of creating a new Isolate for each download,
@@ -465,6 +478,18 @@ void _workerEntryPoint(SendPort mainPort) async {
     ),
   );
 
+  // Redirect-less client used only to resolve a signed URL to its final
+  // CDN address (and to probe range support). Range requests must not be
+  // inferred by the engine mid-redirect, so segmentation always talks to the
+  // resolved URL directly.
+  final probeClient = MClient.httpClient(
+    settings: const ClientSettings(
+      throwOnStatusCode: false,
+      redirectSettings: RedirectSettings.none(),
+      tlsSettings: TlsSettings(verifyCertificates: false),
+    ),
+  );
+
   // Create the receive port for this worker
   final receivePort = ReceivePort();
 
@@ -484,6 +509,7 @@ void _workerEntryPoint(SendPort mainPort) async {
             message.params as FileDownloadParams,
             message.replyPort,
             httpClient,
+            probeClient,
           );
         } else if (message.type == _TaskType.m3u8Download) {
           await processM3u8Download(
@@ -504,6 +530,7 @@ Future<void> _processFileDownload(
   FileDownloadParams params,
   SendPort replyPort,
   Client client,
+  Client probeClient,
 ) async {
   int completed = 0;
   final total = params.pageUrls.length;
@@ -515,7 +542,13 @@ Future<void> _processFileDownload(
       while (queue.isNotEmpty &&
           activeTasks.length < params.concurrentDownloads) {
         final pageUrl = queue.removeFirst();
-        final task = _downloadFile(pageUrl, client, params.itemType, replyPort)
+        final task = _downloadFile(
+                pageUrl,
+                client,
+                probeClient,
+                params.itemType,
+                replyPort,
+              )
             .then((_) {
               if (params.itemType != ItemType.anime) {
                 completed++;
@@ -558,6 +591,7 @@ Future<void> _processFileDownload(
 Future<void> _downloadFile(
   PageUrl pageUrl,
   Client client,
+  Client probeClient,
   ItemType itemType,
   SendPort replyPort,
 ) async {
@@ -582,82 +616,432 @@ Future<void> _downloadFile(
       final targetFile = File(path.setExtension(pageUrl.fileName!, realExt));
       await targetFile.writeAsBytes(bytes);
     } else {
-      // Streaming for videos (saves RAM)
-      await _withRetry(() async {
-        var request = Request('GET', Uri.parse(pageUrl.url));
-        request.headers.addAll(pageUrl.headers ?? {});
-        // Connection/response-headers timeout. Without it, a wifi drop after
-        // streaming has begun makes the stream idle-timeout fire, retry, and
-        // then hang forever on this send with no network — the download stalls
-        // with no progress, no retry, and no error. Bail so _withRetry cycles
-        // and, once exhausted, the failure propagates to the UI.
-        StreamedResponse response = await client
-            .send(request)
-            .timeout(const Duration(seconds: 30));
-        // Accept any 2xx — including 206 Partial Content, which the server
-        // returns when the source extension sends `Range: bytes=0-` on the
-        // streaming request (e.g. AnimeGG). Rejecting 206 here caused 3
-        // retries → silent stall.
-        if (response.statusCode < 200 || response.statusCode >= 300) {
-          throw DownloadPoolException(
-            'Failed to download file: ${pageUrl.fileName!} '
-            '(status ${response.statusCode})',
-          );
-        }
-        int total = response.contentLength ?? 0;
-        int received = 0;
-        // Throttle progress. Emitting on every chunk floods the main isolate
-        // with synchronous DB writes (setProgress) and freezes the whole UI
-        // while a download runs — worst with large single files (anime .mp4).
-        // Send at most once per 1% step (known length) or every 250ms
-        // (unknown length); the final 100% is delivered by onComplete.
-        int lastPercent = -1;
-        final progressWatch = Stopwatch()..start();
-
-        final file = File(pageUrl.fileName!);
-        final sink = file.openWrite();
-        try {
-          // Idle timeout: if no bytes arrive for 30s the connection has
-          // stalled, so fail (and retry) instead of hanging the whole
-          // download forever with no progress.
-          await for (var value in response.stream.timeout(
-            const Duration(seconds: 30),
-            onTimeout: (sink) => sink.addError(
-              TimeoutException('Download stalled (no data for 30s)'),
-            ),
-          )) {
-            sink.add(value);
-            received += value.length;
-            final percent = total > 0 ? (received / total * 100).toInt() : -1;
-            final shouldSend = percent >= 0
-                ? percent != lastPercent
-                : progressWatch.elapsedMilliseconds >= 250;
-            if (shouldSend) {
-              lastPercent = percent;
-              if (percent < 0) progressWatch.reset();
-              try {
-                replyPort.send(
-                  DownloadProgress(
-                    percent < 0 ? 0 : percent,
-                    100,
-                    pageUrl: pageUrl,
-                    itemType,
-                  ),
-                );
-              } catch (_) {}
-            }
-          }
-        } finally {
-          await sink.flush();
-          await sink.close();
-        }
-      }, 3);
+      // Videos: prefer a segmented (range-parallel) download to recover from
+      // per-connection rate limits on vid3rb-type CDNs. If the server cannot
+      // answer ranges, or a segment keeps failing, fall back to the proven
+      // single streaming download so behaviour is never worse than before.
+      bool downloadedSegmented = false;
+      try {
+        downloadedSegmented = await _downloadSegmented(
+          pageUrl,
+          client,
+          probeClient,
+          replyPort,
+        );
+      } catch (_) {
+        downloadedSegmented = false;
+      }
+      if (!downloadedSegmented) {
+        await _downloadSingleStream(pageUrl, client, replyPort);
+      }
     }
   } catch (e) {
     throw DownloadPoolException(
       'Failed to process file: ${pageUrl.fileName!}',
       e,
     );
+  }
+}
+
+/// Single-connection streaming download (the original fast-path for videos).
+/// Kept as the fallback for when range segmentation is unavailable, and as a
+/// reliable baseline that can never produce a corrupt file.
+Future<void> _downloadSingleStream(
+  PageUrl pageUrl,
+  Client client,
+  SendPort replyPort,
+) async {
+  final itemType = ItemType.anime;
+  // Streaming for videos (saves RAM)
+  await _withRetry(() async {
+    var request = Request('GET', Uri.parse(pageUrl.url));
+    request.headers.addAll(pageUrl.headers ?? {});
+    // Connection/response-headers timeout. Without it, a wifi drop after
+    // streaming has begun makes the stream idle-timeout fire, retry, and
+    // then hang forever on this send with no network — the download stalls
+    // with no progress, no retry, and no error. Bail so _withRetry cycles
+    // and, once exhausted, the failure propagates to the UI.
+    StreamedResponse response = await client
+        .send(request)
+        .timeout(const Duration(seconds: 30));
+    // Accept any 2xx — including 206 Partial Content, which the server
+    // returns when the source extension sends `Range: bytes=0-` on the
+    // streaming request (e.g. AnimeGG). Rejecting 206 here caused 3
+    // retries → silent stall.
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw DownloadPoolException(
+        'Failed to download file: ${pageUrl.fileName!} '
+        '(status ${response.statusCode})',
+      );
+    }
+    int total = response.contentLength ?? 0;
+    int received = 0;
+    // Throttle progress. Emitting on every chunk floods the main isolate
+    // with synchronous DB writes (setProgress) and freezes the whole UI
+    // while a download runs — worst with large single files (anime .mp4).
+    // Send at most once per 1% step (known length) or every 250ms
+    // (unknown length); the final 100% is delivered by onComplete.
+    int lastPercent = -1;
+    final progressWatch = Stopwatch()..start();
+
+    final file = File(pageUrl.fileName!);
+    final sink = file.openWrite();
+    try {
+      // Idle timeout: if no bytes arrive for 30s the connection has
+      // stalled, so fail (and retry) instead of hanging the whole
+      // download forever with no progress.
+      await for (var value in response.stream.timeout(
+        const Duration(seconds: 30),
+        onTimeout: (sink) => sink.addError(
+          TimeoutException('Download stalled (no data for 30s)'),
+        ),
+      )) {
+        sink.add(value);
+        received += value.length;
+        final percent = total > 0 ? (received / total * 100).toInt() : -1;
+        final shouldSend = percent >= 0
+            ? percent != lastPercent
+            : progressWatch.elapsedMilliseconds >= 250;
+        if (shouldSend) {
+          lastPercent = percent;
+          if (percent < 0) progressWatch.reset();
+          try {
+            replyPort.send(
+              DownloadProgress(
+                percent < 0 ? 0 : percent,
+                100,
+                pageUrl: pageUrl,
+                itemType,
+              ),
+            );
+          } catch (_) {}
+        }
+      }
+    } finally {
+      await sink.flush();
+      await sink.close();
+    }
+  }, 3);
+}
+
+/// Kicks off the segmented download. Returns true when the full file has been
+/// written, false when the connection does not support ranges or the attempt
+/// must be abandoned (caller then falls back to [_downloadSingleStream]).
+///
+/// Concatenating the exact byte ranges of one file reproduces it bit-for-bit,
+/// so a valid result requires (a) every slice to be served as 206 with the
+/// expected Content-Range and (b) the total to match. Anything else aborts the
+/// attempt and cleans up the parts.
+Future<bool> _downloadSegmented(
+  PageUrl pageUrl,
+  Client client,
+  Client probeClient,
+  SendPort replyPort,
+) async {
+  final headers = pageUrl.headers ?? {};
+  final target = File(pageUrl.fileName!);
+
+  // 1) Resolve redirects to the final CDN URL (redirect-less probe) and read
+  //    the exact total size from a 0-0 range response.
+  String finalUrl;
+  int total = 0;
+  try {
+    final probeRequest = Request('GET', Uri.parse(pageUrl.url));
+    probeRequest.headers.addAll(headers);
+    probeRequest.headers[HttpHeaders.rangeHeader] = 'bytes=0-0';
+    final probe = await probeClient
+        .send(probeRequest)
+        .timeout(const Duration(seconds: 30));
+    try {
+      if (probe.statusCode >= 300 && probe.statusCode < 400) {
+        String? location;
+        for (final entry in probe.headers.entries) {
+          if (entry.key.toLowerCase() == 'location') {
+            location = entry.value;
+            break;
+          }
+        }
+        if (location == null || location.isEmpty) return false;
+        final locationUri = Uri.parse(location);
+        final resolved = locationUri.hasScheme
+            ? locationUri
+            : Uri.parse(pageUrl.url).resolveUri(locationUri);
+        finalUrl = resolved.toString();
+      } else if (probe.statusCode == 206) {
+        finalUrl = pageUrl.url;
+      } else {
+        return false;
+      }
+    } finally {
+      await probe.stream.drain<void>();
+    }
+
+    final sizeRequest = Request('GET', Uri.parse(finalUrl));
+    sizeRequest.headers.addAll(headers);
+    sizeRequest.headers[HttpHeaders.rangeHeader] = 'bytes=0-0';
+    final sizeResponse = await client
+        .send(sizeRequest)
+        .timeout(const Duration(seconds: 30));
+    try {
+      if (sizeResponse.statusCode != 206) return false;
+      total = _parseContentRange(sizeResponse.headers)?.total ?? 0;
+    } finally {
+      await sizeResponse.stream.drain<void>();
+    }
+    if (total < _minSegmentBytes) return false;
+  } catch (_) {
+    return false;
+  }
+
+  // 2) Slice layout. Fewer, larger slices keep per-connection byte-caps from
+  //    interrupting; concurrency stays low to avoid nginx 503s.
+  final segments = math.min(
+    (total / _minSegmentBytes).ceil(),
+    _maxSegments,
+  );
+  final sliceSize = (total / segments).ceil();
+
+  // 3) Download slices concurrently through a rolling window.
+  final progress = _SliceProgress(
+    pageUrl: pageUrl,
+    total: total,
+    replyPort: replyPort,
+  );
+  final ok = await _runSlices(
+    segments,
+    (index) => _downloadSlice(
+      index: index,
+      sliceSize: sliceSize,
+      total: total,
+      finalUrl: finalUrl,
+      headers: headers,
+      client: client,
+      target: target,
+      progress: progress,
+    ),
+    concurrency: _segmentConcurrency,
+  );
+  if (!ok) return false;
+
+  try {
+    await _mergeSegments(target, segments);
+    final finalLength = await target.length();
+    return finalLength == total;
+  } finally {
+    await _cleanupSegmentParts(target, segments);
+  }
+}
+
+/// Runs [segments] slice tasks through a small rolling window, re-launching a
+/// task whenever an active one finishes. Stops scheduling new slices as soon
+/// as one fails, waits for in-flight ones, and resolves once nothing is left
+/// running. Returns true when every slice succeeded.
+Future<bool> _runSlices(
+  int segments,
+  Future<bool> Function(int index) runner, {
+  required int concurrency,
+}) async {
+  final queue = Queue<int>.from(Iterable<int>.generate(segments));
+  var failed = false;
+  var running = 0;
+  final completer = Completer<bool>();
+
+  Future<void> launch() async {
+    running++;
+    final index = queue.removeFirst();
+    var ok = false;
+    try {
+      ok = await runner(index);
+    } catch (_) {
+      ok = false;
+    }
+    if (!ok) failed = true;
+    running--;
+    if (queue.isNotEmpty && !failed) {
+      await launch();
+    } else if (running == 0 && !completer.isCompleted) {
+      completer.complete(!failed);
+    }
+  }
+
+  while (!failed && queue.isNotEmpty && running < concurrency) {
+    launch();
+  }
+  return completer.future;
+}
+
+/// Downloads one byte-slice with resume. Returns false when the slice could
+/// not complete (after retries) or the response proves segmentation invalid.
+Future<bool> _downloadSlice({
+  required int index,
+  required int sliceSize,
+  required int total,
+  required String finalUrl,
+  required Map<String, String> headers,
+  required Client client,
+  required File target,
+  required _SliceProgress progress,
+}) async {
+  final sliceStart = index * sliceSize;
+  final sliceEnd = math.min(sliceStart + sliceSize - 1, total - 1);
+  final partFile = File('${target.path}.part$index');
+
+  for (var attempt = 0; attempt < _segmentMaxAttempts; attempt++) {
+    if (attempt > 0) {
+      await Future.delayed(Duration(seconds: 1 << math.min(attempt, 4)));
+    }
+    try {
+      final have = (await partFile.exists())
+          ? (await partFile.length()).toInt()
+          : 0;
+      final sliceLength = sliceEnd - sliceStart + 1;
+      if (have >= sliceLength) return true;
+      final wantStart = sliceStart + have;
+
+      final request = Request('GET', Uri.parse(finalUrl));
+      request.headers.addAll(headers);
+      request.headers[HttpHeaders.rangeHeader] = 'bytes=$wantStart-$sliceEnd';
+      final response =
+          await client.send(request).timeout(const Duration(seconds: 30));
+
+      if (response.statusCode != 206) {
+        // 503/429: transient server limit — retry with backoff.
+        if (response.statusCode == 503 ||
+            response.statusCode == 429 ||
+            response.statusCode >= 500) {
+          await response.stream.drain<void>();
+          continue;
+        }
+        // Anything else (incl. a 200 that ignored Range) invalidates the
+        // byte-slice plan — abandon segmentation.
+        await response.stream.drain<void>();
+        return false;
+      }
+
+      final range = _parseContentRange(response.headers);
+      if (range == null ||
+          range.total != total ||
+          range.start != wantStart) {
+        await response.stream.drain<void>();
+        return false;
+      }
+
+      final sink = partFile.openWrite(mode: FileMode.writeOnlyAppend);
+      try {
+        await for (var value in response.stream.timeout(
+          const Duration(seconds: 30),
+          onTimeout: (sink) => sink.addError(
+            TimeoutException('Download stalled (no data for 30s)'),
+          ),
+        )) {
+          sink.add(value);
+          progress.add(value.length);
+        }
+      } finally {
+        await sink.flush();
+        await sink.close();
+      }
+
+      if ((await partFile.length()).toInt() < sliceLength) {
+        continue; // partial — resume from the new offset
+      }
+      return true;
+    } catch (_) {
+      // Network/stream error — retry resumes from the partial file.
+    }
+  }
+  return false;
+}
+
+/// Appends all part files into the final target, verifying the byte count.
+Future<void> _mergeSegments(File target, int segments) async {
+  final sink = target.openWrite();
+  try {
+    for (var i = 0; i < segments; i++) {
+      final part = File('${target.path}.part$i');
+      if (!(await part.exists())) {
+        throw DownloadPoolException('Missing segment part $i');
+      }
+      await sink.addStream(part.openRead().cast<List<int>>());
+    }
+  } finally {
+    await sink.flush();
+    await sink.close();
+  }
+}
+
+Future<void> _cleanupSegmentParts(File target, int segments) async {
+  for (var i = 0; i < segments; i++) {
+    try {
+      final part = File('${target.path}.part$i');
+      if (await part.exists()) await part.delete();
+    } catch (_) {}
+  }
+}
+
+/// A parsed `Content-Range: bytes start-end/total` header.
+class _ContentRange {
+  final int start;
+  final int end;
+  final int total;
+
+  _ContentRange(this.start, this.end, this.total);
+}
+
+_ContentRange? _parseContentRange(Map<String, String> headers) {
+  String? raw;
+  for (final entry in headers.entries) {
+    if (entry.key.toLowerCase() == 'content-range') {
+      raw = entry.value;
+      break;
+    }
+  }
+  if (raw == null || raw.isEmpty) return null;
+  final match = RegExp(r'^bytes\s+(\d+)-(\d+)/(\d+)').firstMatch(raw);
+  if (match == null) return null;
+  return _ContentRange(
+    int.parse(match.group(1)!),
+    int.parse(match.group(2)!),
+    int.parse(match.group(3)!),
+  );
+}
+
+/// Aggregate progress for all slices, throttled like the single-stream path.
+class _SliceProgress {
+  final PageUrl pageUrl;
+  final int total;
+  final SendPort replyPort;
+
+  int received = 0;
+  int lastPercent = -1;
+  final Stopwatch watch = Stopwatch()..start();
+
+  _SliceProgress({
+    required this.pageUrl,
+    required this.total,
+    required this.replyPort,
+  });
+
+  void add(int length) {
+    received += length;
+    final percent = total > 0 ? (received / total * 100).toInt() : -1;
+    final shouldSend = percent >= 0
+        ? percent != lastPercent
+        : watch.elapsedMilliseconds >= 250;
+    if (shouldSend) {
+      lastPercent = percent;
+      if (percent < 0) watch.reset();
+      try {
+        replyPort.send(
+          DownloadProgress(
+            percent < 0 ? 0 : percent,
+            100,
+            pageUrl: pageUrl,
+            ItemType.anime,
+          ),
+        );
+      } catch (_) {}
+    }
   }
 }
 
