@@ -1,0 +1,21 @@
+name: Check Analyze
+
+# Temporary: fast Dart validation for the fix-download branch while the iOS
+# build-ios.yml remains the tag-triggered packaging pipeline. Deleted before
+# this branch is finalized.
+on:
+  push:
+    branches:
+      - fix-download
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - run: flutter pub get
+      - run: flutter analyze --no-fatal-infos --no-fatal-warnings
