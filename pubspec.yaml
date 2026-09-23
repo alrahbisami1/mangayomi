@@ -63,6 +63,7 @@ dependencies:
   crypto: ^3.0.7
   cupertino_icons: ^1.0.9
   window_manager: ^0.5.1
+  screen_retriever: ^0.2.2
   ffi: ^2.1.5
   ffigen: ^20.1.1
   http_interceptor: ^2.0.0

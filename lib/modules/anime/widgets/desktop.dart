@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
@@ -15,6 +16,7 @@ import 'package:mangayomi/modules/more/settings/player/providers/player_state_pr
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 import 'package:media_kit_video/media_kit_video_controls/src/controls/extensions/duration.dart';
+import 'package:screen_retriever/screen_retriever.dart';
 import 'package:window_manager/window_manager.dart';
 
 class DesktopControllerWidget extends ConsumerStatefulWidget {
@@ -1024,7 +1026,39 @@ class _CustomMaterialDesktopFullscreenButtonState
   }
 }
 
+bool _windowsDesktopFullScreen = false;
+Offset _savedWindowPosition = Offset.zero;
+Size _savedWindowSize = Size.zero;
+
 Future<bool> setFullScreen({bool? value}) async {
+  if (Platform.isWindows) {
+    // window_manager's setFullScreen on Windows can leave the native window
+    // border (title bar) visible. Use the frameless approach instead: drop
+    // the frame and cover the whole screen, restoring the frame + geometry
+    // when leaving fullscreen.
+    final wantFullscreen = value ?? !_windowsDesktopFullScreen;
+    _windowsDesktopFullScreen = wantFullscreen;
+    if (wantFullscreen) {
+      final bounds = await windowManager.getBounds();
+      _savedWindowPosition = bounds.topLeft;
+      _savedWindowSize = bounds.size;
+      await windowManager.setAsFrameless();
+      await windowManager.setPosition(Offset.zero);
+      final display = await screenRetriever.getPrimaryDisplay();
+      await windowManager
+          .setSize(Size(display.size.width, display.size.height));
+    } else {
+      await windowManager.setTitleBarStyle(
+        TitleBarStyle.normal,
+        windowButtonVisibility: true,
+      );
+      if (_savedWindowSize != Size.zero) {
+        await windowManager.setSize(_savedWindowSize);
+        await windowManager.setPosition(_savedWindowPosition);
+      }
+    }
+    return wantFullscreen;
+  }
   if (value != null) {
     await windowManager.setFullScreen(value);
     return value;
